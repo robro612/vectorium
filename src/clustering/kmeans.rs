@@ -48,6 +48,9 @@ pub struct KMeans {
     seed: Option<u64>,
     /// Spherical k-means: L2-normalize each centroid after every update step.
     spherical: bool,
+    /// Seed each point's centroid search with the centroid it was assigned last iteration.
+    /// Only affects [`KMeans::train_with_index`]; the flat path has no entry point to seed.
+    use_prev_as_seed: bool,
 }
 
 impl KMeans {
@@ -542,6 +545,11 @@ impl KMeans {
         };
 
         for redo in 0..self.n_redo {
+            // Warm-start state, scoped to this restart: a redo re-initialises the centroid
+            // slots from a fresh sample, so assignments carried across the boundary would name
+            // slots whose geometry is unrelated to what produced them.
+            let mut prev_assignments: Option<Vec<(f32, usize)>> = None;
+
             let mut centroids_builder: PlainDenseDatasetGrowable<C, SquaredEuclideanDistance> =
                 PlainDenseDatasetGrowable::with_capacity(ScalarDenseQuantizer::new(d), k);
             // Offset by `redo` so each restart draws a different initial sample
@@ -567,8 +575,17 @@ impl KMeans {
                 let build_idx_time = t0.elapsed();
 
                 let t0 = Instant::now();
-                let assignments =
-                    Self::assign_with_index(training_dataset, &centroid_index, search_params);
+                let seeds = if self.use_prev_as_seed {
+                    prev_assignments.as_deref()
+                } else {
+                    None
+                };
+                let assignments = Self::assign_with_index_seeded(
+                    training_dataset,
+                    &centroid_index,
+                    search_params,
+                    seeds,
+                );
                 let search_time = t0.elapsed();
 
                 let t0 = Instant::now();
@@ -596,11 +613,17 @@ impl KMeans {
                     best_centroids = new_centroids.clone();
                 }
                 centroids = new_centroids;
+                // Slot `j` still holds cluster `j`'s mean after the update, so these remain
+                // valid entry points into the index the next iteration builds.
+                if self.use_prev_as_seed {
+                    prev_assignments = Some(assignments);
+                }
 
                 if self.verbose {
                     println!(
-                        "Iteration {i}, imbalance: {imbalance_factor:.4}, splits: {n_split}, \
-                         build_idx: {build_idx_time:.2?}, search: {search_time:.2?}, split: {split_time:.2?}"
+                        "Iteration {i}, obj: {obj}, imbalance: {imbalance_factor:.4}, \
+                         splits: {n_split}, build_idx: {build_idx_time:.2?}, \
+                         search: {search_time:.2?}, split: {split_time:.2?}"
                     );
                 }
             }
@@ -639,9 +662,51 @@ impl KMeans {
         for<'q> Q: Index<Query<'q> = DenseVectorView<'q, f32>>,
         Q::SearchParams: Sync,
     {
+        Self::assign_with_index_seeded(dataset, index, search_params, None)
+    }
+
+    /// [`assign_with_index`](Self::assign_with_index), optionally warm-started from a previous
+    /// assignment of the same `dataset`.
+    ///
+    /// `prev` is a previous return value of this function, so `prev[i].1` is the centroid point
+    /// `i` was assigned last time; it is handed to the index as that point's entry point via
+    /// [`Index::search_seeded`]. Only the centroid IDs are read — the distances in `prev` were
+    /// measured against the *previous* centroid positions and are stale by now.
+    ///
+    /// `prev` must have one entry per vector in `dataset`, and its centroid IDs must be valid
+    /// in `index`. Passing `None` is exactly the unseeded assignment.
+    ///
+    /// An index that ignores seeds (the [`Index::search_seeded`] default) returns the same
+    /// assignment either way, so this is safe to call unconditionally.
+    pub fn assign_with_index_seeded<Q, T>(
+        dataset: &Centroids<T>,
+        index: &Q,
+        search_params: &Q::SearchParams,
+        prev: Option<&[(f32, usize)]>,
+    ) -> Vec<(f32, usize)>
+    where
+        T: Float
+            + ValueType
+            + FromF32
+            + num_traits::ToPrimitive
+            + num_traits::FromPrimitive
+            + Clone,
+        Q: Index + Sync,
+        for<'q> Q: Index<Query<'q> = DenseVectorView<'q, f32>>,
+        Q::SearchParams: Sync,
+    {
         let values = dataset.values();
         let dim = dataset.output_dim();
         let n = dataset.len();
+
+        if let Some(prev) = prev {
+            assert_eq!(
+                prev.len(),
+                n,
+                "previous assignment has {} entries for {n} vectors",
+                prev.len()
+            );
+        }
 
         (0..n)
             .into_par_iter()
@@ -655,7 +720,11 @@ impl KMeans {
                             .map(|x| x.to_f32().expect("value type is not representable as f32")),
                     );
                     let query = DenseVectorView::new(query_buf.as_slice());
-                    let results = index.search(query, 1, search_params);
+                    // One seed per point: the centroid it held last iteration.
+                    let seeds = prev.map_or([0usize; 0].as_slice(), |p| {
+                        std::slice::from_ref(&p[i].1)
+                    });
+                    let results = index.search_seeded(query, 1, search_params, seeds);
                     let best = results
                         .into_iter()
                         .next()
@@ -674,6 +743,7 @@ pub struct KMeansBuilder {
     max_points_per_centroid: usize,
     seed: Option<u64>,
     spherical: bool,
+    use_prev_as_seed: bool,
 }
 
 impl Default for KMeansBuilder {
@@ -685,6 +755,7 @@ impl Default for KMeansBuilder {
             max_points_per_centroid: 256,
             seed: None,
             spherical: false,
+            use_prev_as_seed: false,
         }
     }
 }
@@ -733,6 +804,32 @@ impl KMeansBuilder {
     }
 
     /// Spherical k-means: L2-normalize centroids after every update step.
+    /// Warm-start each iteration's centroid search from the previous iteration's assignment
+    /// (`train_with_index` only). Off by default.
+    ///
+    /// The centroid index is rebuilt every iteration, but centroid *slots* are stable — slot
+    /// `j` always holds cluster `j`'s mean — so last iteration's answer is a valid entry point
+    /// into this iteration's index even though the vector at that slot has moved.
+    ///
+    /// Two consequences, in opposite directions:
+    ///
+    /// - The seed is in the search's own result set, so a point can never be reassigned to a
+    ///   centroid further away than the one it already had. The objective is then monotone
+    ///   non-increasing across iterations, which approximate assignment does not otherwise
+    ///   guarantee. (Not under [`spherical`](KMeansBuilder::spherical), where the renormalized
+    ///   centroid is no longer the minimizing mean of its cluster.)
+    /// - The remaining error stops being independent across iterations. A point whose true
+    ///   nearest centroid is unreachable from its own previous assignment is unreachable from
+    ///   it every iteration, so instead of averaging out over the run it biases the same
+    ///   centroids the same way each time. Whether that costs more quality than the monotone
+    ///   objective buys is a property of the index, not of k-means: it depends on whether the
+    ///   index still explores independently of the seeds it was handed.
+    #[must_use]
+    pub fn use_prev_as_seed(mut self, use_prev_as_seed: bool) -> KMeansBuilder {
+        self.use_prev_as_seed = use_prev_as_seed;
+        self
+    }
+
     pub fn spherical(mut self, spherical: bool) -> KMeansBuilder {
         self.spherical = spherical;
         self
@@ -745,6 +842,7 @@ impl KMeansBuilder {
             verbose: self.verbose,
             seed: self.seed,
             spherical: self.spherical,
+            use_prev_as_seed: self.use_prev_as_seed,
         }
     }
 }
@@ -893,6 +991,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `FlatIndex` keeps [`Index::search_seeded`]'s default, which ignores seeds, so turning
+    /// the warm start on must change nothing at all. That is the contract that makes
+    /// `assign_with_index_seeded` safe to call unconditionally: an index opts in by overriding
+    /// the method, and every other index is unaffected by the plumbing.
+    #[test]
+    fn use_prev_as_seed_is_inert_for_an_index_that_ignores_seeds() {
+        let encoder = PlainDenseQuantizer::<f32, SquaredEuclideanDistance>::new(2);
+        let mut builder = PlainDenseDatasetGrowable::new(encoder);
+        for pt in BLOB_POINTS.iter() {
+            builder.push(DenseVectorView::new(&pt[..]));
+        }
+        let dataset: Centroids<f32> = builder.into();
+
+        let train = |use_prev_as_seed: bool| {
+            let kmeans = KMeansBuilder::new()
+                .n_iter(10)
+                .n_redo(3)
+                .seed(Some(42))
+                .use_prev_as_seed(use_prev_as_seed)
+                .build();
+            kmeans
+                .train_with_index::<FlatIndex<Centroids<f32>>, f32, f32>(
+                    &dataset,
+                    2,
+                    None,
+                    FlatIndex::from,
+                    &(),
+                )
+                .values()
+                .to_vec()
+        };
+
+        assert_eq!(
+            train(false),
+            train(true),
+            "seeding changed the centroids of an index that ignores seeds"
+        );
+    }
+
+    /// A seeded assignment is `prev`-shaped, so a mismatched length is a caller bug that must
+    /// not be silently truncated to whichever is shorter.
+    #[test]
+    #[should_panic(expected = "previous assignment has")]
+    fn assign_with_index_seeded_rejects_a_prev_of_the_wrong_length() {
+        let encoder = PlainDenseQuantizer::<f32, SquaredEuclideanDistance>::new(2);
+        let mut builder = PlainDenseDatasetGrowable::new(encoder);
+        for pt in BLOB_POINTS.iter() {
+            builder.push(DenseVectorView::new(&pt[..]));
+        }
+        let dataset: Centroids<f32> = builder.into();
+        let index = FlatIndex::from(dataset.clone());
+
+        let prev = vec![(0.0f32, 0usize); BLOB_POINTS.len() - 1];
+        let _ = KMeans::assign_with_index_seeded(&dataset, &index, &(), Some(&prev));
     }
 
     #[test]

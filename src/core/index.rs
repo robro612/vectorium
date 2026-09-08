@@ -30,6 +30,30 @@ pub trait Index {
         k: usize,
         search_params: &Self::SearchParams,
     ) -> Vec<ScoredVector<Self::Distance>>;
+
+    /// Search primed from caller-supplied entry points, given as IDs this index's own
+    /// [`search`](Index::search) returns. Every seed must be a vector in the index.
+    ///
+    /// Seeds are a hint about *where to start looking*, so an index is always free to ignore
+    /// them: the default does exactly that, and it is what indexes with no notion of a starting
+    /// point (a flat scan, which already looks everywhere) should keep. Graph indexes override
+    /// it, since for them the entry point is the whole cost model.
+    ///
+    /// Callers that iterate — refining an answer they already have, as k-means does when it
+    /// reassigns points to moved centroids — can pass the previous round's answer here. An
+    /// index that honours seeds should guarantee it never returns anything worse than the best
+    /// seed it was given, which is what makes such a loop monotone rather than merely fast.
+    ///
+    /// An empty `seeds` must behave exactly as [`search`](Index::search).
+    fn search_seeded<'q>(
+        &self,
+        query: Self::Query<'q>,
+        k: usize,
+        search_params: &Self::SearchParams,
+        _seeds: &[usize],
+    ) -> Vec<ScoredVector<Self::Distance>> {
+        self.search(query, k, search_params)
+    }
 }
 
 /// Optional metadata for indexes that store a fixed collection of vectors.
